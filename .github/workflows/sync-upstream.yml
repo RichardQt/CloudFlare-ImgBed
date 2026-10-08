@@ -1,84 +1,67 @@
-name: Upstream Sync
-
-permissions:
-  contents: write
-  actions: write
-  issues: write
+name: Sync upstream
 
 on:
   schedule:
-    - cron: "0 0 * * *" # every day
+    # Once a day at 00:00 UTC.
+    - cron: "0 0 * * *"
   workflow_dispatch:
-    inputs:
-      confirm_breaking_update:
-        description: "I have reviewed any compatibility update notice and agree to apply it if present / 我已阅读可能存在的兼容性更新公告，并同意在有此类更新时应用"
-        required: true
-        default: false
-        type: boolean
 
-concurrency:
-  group: upstream-sync-${{ github.repository }}
-  cancel-in-progress: false
+permissions:
+  contents: write
 
 jobs:
-  sync_latest_from_upstream:
-    name: Sync latest commits from upstream repo
+  sync:
+    name: Sync default branch from upstream
     runs-on: ubuntu-latest
-    if: ${{ github.event.repository.fork }}
-
     steps:
-      - name: Checkout target repo
-        uses: actions/checkout@v6
-        with:
-          ref: main
-          fetch-depth: 0
-
-      - name: Check breaking update policy
-        id: breaking_guard
+      - name: Merge upstream into the default branch
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          UPSTREAM_REPO: MarSeventh/CloudFlare-ImgBed
-          UPSTREAM_BRANCH: main
-          ALLOW_BREAKING_UPDATE: ${{ github.event_name == 'workflow_dispatch' && inputs.confirm_breaking_update == true }}
-        run: bash .github/breaking-updates/scripts/breaking-update-guard.sh check
-
-      - name: Sync upstream changes
-        id: sync
-        if: steps.breaking_guard.outputs.blocked != 'true'
-        uses: aormsby/Fork-Sync-With-Upstream-action@v3.4
-        with:
-          upstream_sync_repo: MarSeventh/CloudFlare-ImgBed
-          upstream_sync_branch: main
-          target_sync_branch: main
-          target_repo_token: ${{ secrets.GITHUB_TOKEN }}
-          test_mode: false
-
-      - name: Complete breaking update notices
-        if: steps.sync.outcome == 'success'
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: bash .github/breaking-updates/scripts/breaking-update-guard.sh complete
-
-      - name: Trigger Worker deploy
-        if: steps.sync.outcome == 'success'
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: gh workflow run deploy-worker.yml --repo "${{ github.repository }}" --ref main
-
-      - name: Sync failure guidance
-        if: failure() && steps.sync.outcome == 'failure'
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          {
-            echo "## ⚠️ 上游同步未完成 / Upstream synchronization did not complete"
-            echo
-            echo "上游同步步骤未能完成。若上游近期修改了 workflow 文件，GitHub 可能会暂停包含 workflow 变更的自动同步；也可能是当前 Fork 的 Actions 权限或同步权限发生了变化。"
-            echo
-            echo "The upstream synchronization step could not be completed. If the upstream workflow files changed recently, GitHub may pause automatic synchronization that includes workflow changes. The issue may also be related to Actions or synchronization permissions in this fork."
-            echo
-            echo "建议先在 GitHub 页面手动执行一次 **Sync fork**，确认 Actions 具有读写权限后，再重新运行本工作流。"
-            echo
-            echo "Please manually use **Sync fork** on GitHub, confirm that Actions has read and write permissions, and then rerun this workflow."
-          } >> "$GITHUB_STEP_SUMMARY"
-          echo "[Error] 上游同步未能完成。若上游近期修改了 workflow 文件，请先在 GitHub 页面手动执行一次 Sync Fork，然后重新运行本工作流。"
-          echo "[Error] The upstream sync could not be completed. If the upstream workflow files changed recently, manually run Sync Fork on GitHub and then rerun this workflow."
-          exit 1
+          set -euo pipefail
+
+          repo="${GITHUB_REPOSITORY}"
+          meta="$(gh repo view "$repo" --json isFork,defaultBranchRef)"
+          is_fork="$(jq -r '.isFork' <<<"$meta")"
+          branch="$(jq -r '.defaultBranchRef.name // empty' <<<"$meta")"
+
+          if [ "$is_fork" != "true" ]; then
+            echo "Not a fork: ${repo} has no upstream parent, so merge-upstream cannot run."
+            exit 1
+          fi
+
+          if [ -z "$branch" ]; then
+            echo "Could not determine the default branch of ${repo}."
+            exit 1
+          fi
+
+          set +e
+          resp="$(gh api --method POST "repos/${repo}/merge-upstream" -f "branch=${branch}" 2>&1)"
+          status=$?
+          set -e
+
+          if [ "$status" -ne 0 ]; then
+            printf '%s\n' "$resp"
+            if printf '%s\n' "$resp" | grep -Eiq 'merge conflict|HTTP 409'; then
+              echo "Merge conflict: ${branch} diverged from upstream. Resolve it manually. This workflow will not force-push or try to resolve the conflict."
+              exit 1
+            fi
+            if printf '%s\n' "$resp" | grep -Eiq 'not a fork'; then
+              echo "Not a fork: ${repo} has no upstream parent, so merge-upstream cannot run."
+              exit 1
+            fi
+            echo "Upstream sync failed for ${branch}."
+            exit 1
+          fi
+
+          merge_type="$(printf '%s\n' "$resp" | jq -r '.merge_type // empty' 2>/dev/null || true)"
+          if [ "$merge_type" = "none" ]; then
+            exit 0
+          fi
+          if [ -n "$merge_type" ]; then
+            echo "Synced ${branch} from upstream (${merge_type})."
+            exit 0
+          fi
+
+          printf '%s\n' "$resp"
